@@ -14,21 +14,29 @@ import FoundationModels
 /// the CLI is available the next time fmtool starts, with nothing to change here.
 ///
 /// What is offered is decided by the CLI too. Every command says what it costs
-/// if it was the wrong one — "read", "change" or "destroy" — and the three are
-/// treated differently rather than the whole write half being shut off:
+/// if it was the wrong one — "read", "change" or "destroy" — and whether it is
+/// about what is drawn on the canvas at all. Reads are offered whatever they
+/// are about; writing is offered for the board and nowhere else, because this
+/// same CLI installs plugins and rewrites config, and a small model asked to
+/// move a tile will sometimes pick one of those.
 ///
-///   read     always offered; a question cannot break anything.
-///   change   offered, for the board: moving a tile, pinning a thing, making a
-///            want. A misheard name here costs a shrug and `mywant undo`.
-///   destroy  a separate tool that refuses to run until the person has said yes
-///            (see Destructive.swift). A deleted want is not coming back, and
-///            nothing in a chat bubble should be able to reach one by accident.
+/// Destroying is offered too, and that is new. It used to be a separate tool
+/// here that refused to run until the person had said yes — a gate written in
+/// Swift, beside a second one written in Go, disagreeing about which words are
+/// a yes. Now nothing is run here at all: every command goes to the caller,
+/// which knows the risk, asks the person when there is something to ask about,
+/// and never lets this model answer for them. See Broker.swift.
 struct MyWantCommand: Decodable {
     let path: String
     let short: String?
     let use: String?
     let readOnly: Bool
     let risk: String?
+    /// Whether it concerns what is drawn — the tiles, the things, where they
+    /// stand — as opposed to the server behind them. The CLI labels this
+    /// itself; a copy of that judgement lived here as a list of group names
+    /// and went stale the day `gui tile set` became board work.
+    let canvas: Bool?
 }
 
 enum MyWantCLI {
@@ -84,43 +92,28 @@ enum MyWantCLI {
         return commands
     }
 
-    /// The groups a guide to a board has business in.
+    /// What to offer the model.
     ///
-    /// Read commands are offered whatever group they are in — asking is free.
-    /// Writing is not, and this CLI can also install plugins, rewrite config and
-    /// create want types, none of which is canvas work and all of which a small
-    /// model would sometimes pick when it meant something else. So the writing
-    /// half is narrowed to what the board is made of.
-    /// "do" is in here because making something takes more than one command.
+    /// Reads always. Writes — change and destroy alike — only where the CLI
+    /// says the command is about the canvas, plus `do`, which is how anything
+    /// gets built and is not canvas work by the CLI's own reckoning (it makes
+    /// a goal; the goal does the board work). Destroying is in the same list
+    /// as everything else now: the caller stops it, not this.
     ///
     /// Asked "NakanoのWeatherを作りたい" in chat, this agent ran
     /// `wants create AAA-test Weather` — the words of the request as
     /// positional arguments — which the CLI refuses, since a want is created
     /// with a type and its parameters. Working those out is a handful of small
-    /// questions, and MyWant already does it: `mywant do "<what was asked>"`
-    /// makes a goal want that looks up the type, fills the parameters, runs
-    /// the create, and stops to ask about anything it cannot undo.
-    ///
-    /// So the chat answers questions and hands over the building.
-    static let boardGroups: Set<String> = ["wants", "thing", "world", "state", "gui", "undo", "do"]
-
-    /// Starting and stopping the GUI server is not arranging a canvas; it is
-    /// turning off the screen the canvas is on.
-    static let neverOffered: Set<String> = ["gui start", "gui stop"]
-
-    /// What to offer the model: the ones it may run, and the ones it must ask
-    /// about first.
-    static func offered(writes: Bool) -> (safe: [MyWantCommand], dangerous: [MyWantCommand]) {
+    /// questions, and MyWant already does it: `do` takes the request and is
+    /// handed straight back to the caller (see the call below), which looks up
+    /// the type, fills the parameters and runs the create.
+    static func offered(writes: Bool) -> [MyWantCommand] {
         let commands = allCommands()
         let risk = { (c: MyWantCommand) in c.risk ?? (c.readOnly ? "read" : "change") }
-        let inBoard = { (c: MyWantCommand) in
-            MyWantCLI.boardGroups.contains(c.path.split(separator: " ").first.map(String.init) ?? "")
-                && !MyWantCLI.neverOffered.contains(c.path)
-        }
-        var safe = commands.filter { risk($0) == "read" || (writes && risk($0) == "change" && inBoard($0)) }
-        let dangerous = writes ? commands.filter { risk($0) == "destroy" && inBoard($0) } : []
-        safe = trimmed(safe)
-        return (safe, dangerous)
+        let board = { (c: MyWantCommand) in c.canvas == true || c.path == "do" }
+        return trimmed(commands.filter {
+            risk($0) == "read" || (writes && board($0))
+        })
     }
 
     /// Two kinds are left out of what the model is offered, and only out of
@@ -142,49 +135,13 @@ enum MyWantCLI {
     }
 }
 
-/// What the board calls something, if it calls anything that.
-enum BoardName {
-    case exact(String)
-    /// The same name, spelled the way the board spells it.
-    case corrected(String)
-    /// Nothing close enough, with whatever was nearest for the asking.
-    case unknown([String])
-}
-
-extension MyWantCLI {
-    /// Matches a name against everything standing on the board.
-    ///
-    /// Exactly first, then ignoring case — "Nakanoのweather" and
-    /// "NakanoのWeather" are the same want and only one of them exists — then
-    /// by containment, which is what turns "Nakano" into a list to choose
-    /// from rather than a silent miss.
-    static func boardName(matching name: String) -> BoardName {
-        let wanted = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !wanted.isEmpty, let binary = binaryPath(),
-              let result = try? run(binary, ["board", "--json"], timeout: 20),
-              result.status == 0,
-              let data = result.out.data(using: .utf8),
-              let entries = try? JSONDecoder().decode([BoardEntry].self, from: data)
-        else { return .exact(name) } // no board to check against: let the CLI answer
-
-        let names = entries.map(\.name)
-        if names.contains(wanted) { return .exact(wanted) }
-        if let same = names.first(where: { $0.lowercased() == wanted.lowercased() }) {
-            return .corrected(same)
-        }
-        let near = names.filter {
-            $0.lowercased().contains(wanted.lowercased()) || wanted.lowercased().contains($0.lowercased())
-        }
-        if near.count == 1 { return .corrected(near[0]) }
-        return .unknown(Array(near.prefix(5)))
-    }
-}
-
-private struct BoardEntry: Decodable {
-    let name: String
-}
-
-/// One tool for every command the CLI can be asked to read.
+/// One tool for every command the CLI offers, destroying included.
+///
+/// One, because two invited the model to reach for the wrong one: asked to
+/// DELETE a want it once chose `wants disconnect`, which is a different tool's
+/// neighbour doing a very different thing. What stops a deletion is not which
+/// tool it arrived in — it is the caller, which refuses to run it until a
+/// person has said yes.
 struct MyWantCLITool: LocalTool {
     let name = "mywant_cli"
     let commands: [MyWantCommand]
@@ -195,6 +152,10 @@ struct MyWantCLITool: LocalTool {
     /// Whether the offered list includes commands that change the board, which
     /// decides whether the description bothers to say what they are.
     var canWrite: Bool { commands.contains { ($0.risk ?? "read") == "change" } }
+    /// Whether anything offered takes something away, which is worth a
+    /// sentence of its own: the model has to know it may call these, and that
+    /// what comes back may be a question rather than a result.
+    var canDestroy: Bool { commands.contains { $0.risk == "destroy" } }
     private let binary: String
     private static let outputLimit = 4000
 
@@ -247,6 +208,15 @@ struct MyWantCLITool: LocalTool {
              + "To make a want: 'wants create' with args \"--type <type> --at <x>,<y>\". "
              + "To take back the last change: 'undo', with no args."
            : "")
+        // Said plainly, because the model's instinct is to refuse on the
+        // person's behalf and then report it as impossible. It is not this
+        // tool's to refuse: call it, and relay what comes back.
+        + (canDestroy
+           ? " Asked to DELETE or REMOVE something, call the command that does it. Nothing is destroyed by "
+             + "calling: if a person has to agree first, the reply says so and says what is waiting. "
+             + "Tell them that, in their language, and say it is permanent — never that it failed and "
+             + "never that it is impossible."
+           : "")
     }
 
     var argsSchema: DynamicGenerationSchema {
@@ -288,7 +258,7 @@ struct MyWantCLITool: LocalTool {
         guard commands.contains(where: { $0.path == command }) else {
             return "mywant cannot do that, or it changes something: \(command)"
         }
-        var argv = command.split(separator: " ").map(String.init)
+        var extraArgv: [String] = []
         // `do` is not run here at all: it is handed back, with the words as
         // they were said.
         //
@@ -323,38 +293,49 @@ struct MyWantCLITool: LocalTool {
             // gave the CLI one very long type name.
             let hasFlags = extra.hasPrefix("-") || extra.contains(" -")
             if placeholders > 1 || hasFlags {
-                argv.append(contentsOf: extra.split(separator: " ").map(String.init))
+                extraArgv = extra.split(separator: " ").map(String.init)
             } else {
-                argv.append(extra)
+                extraArgv = [extra]
             }
         }
+        let sentence = (["mywant", command] + extraArgv).joined(separator: " ")
         // What was actually run, on stderr beside the "[tool: …]" line. Without
         // it a wrong answer is a mystery: the tool fired, and nothing says
         // whether the model asked for the wrong command or passed the whole
         // question where a name belonged.
-        FileHandle.standardError.write(("[mywant " + argv.joined(separator: " ") + "]\n").data(using: .utf8)!)
-        let result = try MyWantCLI.run(binary, argv)
-        let commandWords = command.split(separator: " ").map(String.init)
-        var text = result.status == 0
-            ? result.out.trimmingCharacters(in: .whitespacesAndNewlines)
-            : "ERROR: mywant \(argv.joined(separator: " ")) failed: "
-              + result.err.trimmingCharacters(in: .whitespacesAndNewlines)
-        // The failure worth naming, because it is the one the model makes and
-        // then reports as a success: a command that names something, called
-        // with nothing to name. Said plainly and first, so it is not lost in a
-        // page of usage text.
+        FileHandle.standardError.write(("[" + sentence + "]\n").data(using: .utf8)!)
+
+        var text: String
+        var failed: Bool
+        if let answer = await Broker.shared.run(command: command, args: extraArgv) {
+            text = answer.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            failed = !answer.ok
+            // Not run at all — refused, or waiting for a person to say yes.
+            // Handed back word for word: the reply is written for the model to
+            // relay, and the usage coaching below is about a command that ran.
+            if !answer.ran {
+                return text.isEmpty ? "NOT RUN — mywant gave no reason." : text
+            }
+        } else {
+            // Nobody is brokering: a one-shot `fmtool "question"` from a
+            // terminal, where this process is the whole of the agent. It runs
+            // the command itself, as it did before there was a caller to ask.
+            let result = try MyWantCLI.run(binary, command.split(separator: " ").map(String.init) + extraArgv)
+            failed = result.status != 0
+            text = failed
+                ? "ERROR: \(sentence) failed: " + result.err.trimmingCharacters(in: .whitespacesAndNewlines)
+                : result.out.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         // The failure worth naming, because it is the one the model makes and
         // then reports as a success: a command called with less than it names.
         // The usage line says what it wanted, so the correction is exact rather
         // than an invitation to try a different command — which is what
         // happened when it only said "failed": three commands in a row, none of
         // them given a cell.
-        if result.status != 0 {
+        if failed {
             let usage = commands.first { $0.path == command }?.use ?? ""
             let wanted = usage.split(separator: " ").dropFirst().joined(separator: " ")
-            let given = argv.count > commandWords.count
-                ? argv.suffix(from: commandWords.count).joined(separator: " ")
-                : ""
+            let given = extraArgv.joined(separator: " ")
             if !wanted.isEmpty {
                 text = "ERROR: '\(command)' takes \(wanted) — "
                     + (given.isEmpty ? "nothing was given" : "you gave \"\(given)\"")
@@ -362,7 +343,7 @@ struct MyWantCLITool: LocalTool {
                     + "space-separated, and nothing else."
             }
         }
-        if text.isEmpty { return "mywant \(argv.joined(separator: " ")) printed nothing" }
+        if text.isEmpty { return sentence + " printed nothing" }
         // The same clip ReadFileTool uses: on-device context is ~8k tokens and a
         // want list can run to tens of KB.
         return text.count > Self.outputLimit
